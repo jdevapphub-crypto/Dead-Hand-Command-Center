@@ -75,25 +75,71 @@
     display: flex; justify-content: space-between;
   }
   .sidebar .stats strong { color: #fff; }
+  .sidebar .stats .watching strong { color: #7c3aed; }
+
+  /* Filter bar */
+  .filter-bar {
+    padding: 8px 14px; border-bottom: 1px solid #222;
+    display: flex; gap: 6px;
+  }
+  .filter-bar button {
+    flex: 1; padding: 6px 8px; border-radius: 6px;
+    background: transparent; border: 1px solid #333;
+    color: #666; font-size: 10px; font-weight: bold;
+    cursor: pointer; letter-spacing: 1px;
+    transition: all 0.15s;
+  }
+  .filter-bar button.active {
+    background: #1a1200; border-color: #d4a017; color: #d4a017;
+  }
+  .filter-bar button.watched.active {
+    background: #1a0a2a; border-color: #7c3aed; color: #a78bfa;
+  }
 
   #deviceList { flex: 1; overflow-y: auto; }
 
   .device-row {
     padding: 12px 14px; border-bottom: 1px solid #1a1a1a;
     cursor: pointer; transition: background 0.15s;
+    position: relative;
   }
   .device-row:hover { background: #151515; }
   .device-row.selected { background: #1a1200; border-left: 3px solid #d4a017; }
+  .device-row.watched {
+    background: linear-gradient(90deg, rgba(124,58,237,0.06), transparent);
+  }
+  .device-row.watched.selected {
+    background: linear-gradient(90deg, rgba(124,58,237,0.15), rgba(212,160,23,0.05));
+  }
   .device-row .name { color: #fff; font-weight: bold; font-size: 13px; }
   .device-row .code { color: #22c55e; font-size: 11px; letter-spacing: 2px; margin-top: 2px; }
   .device-row .meta { color: #888; font-size: 10px; margin-top: 4px; }
-  .device-row .badge {
+
+  .badges { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 6px; }
+  .badge {
     display: inline-block; padding: 2px 6px; border-radius: 4px;
-    font-size: 9px; font-weight: bold; margin-top: 4px; letter-spacing: 1px;
+    font-size: 9px; font-weight: bold; letter-spacing: 1px;
   }
   .badge.online { background: #0d2a0d; color: #22c55e; }
   .badge.recent { background: #2a2200; color: #d4a017; }
   .badge.offline { background: #1a1a1a; color: #666; }
+  .badge.watched {
+    background: #1a0a2a; color: #a78bfa;
+    border: 1px solid #7c3aed;
+    animation: pulse-watch 2s ease-in-out infinite;
+  }
+  @keyframes pulse-watch {
+    0%, 100% { box-shadow: 0 0 0 rgba(124,58,237,0.4); }
+    50% { box-shadow: 0 0 8px rgba(124,58,237,0.6); }
+  }
+
+  .watcher-names {
+    margin-top: 6px;
+    font-size: 10px;
+    color: #a78bfa;
+    line-height: 1.4;
+  }
+  .watcher-names .label { color: #666; }
 
   .ring-btn {
     margin-top: 8px;
@@ -135,11 +181,16 @@
     transform: translateY(-100%); transition: transform 0.3s;
   }
   .banner.show { transform: translateY(0); }
+  .banner.watch {
+    background: #1a0a2a; border-bottom-color: #7c3aed;
+    color: #a78bfa;
+  }
   .banner button {
     margin-left: auto; background: #ff2222; color: #fff;
     border: none; padding: 6px 12px; border-radius: 6px;
     cursor: pointer; font-weight: bold; font-size: 11px;
   }
+  .banner.watch button { background: #7c3aed; }
 
   .empty {
     padding: 30px 20px; text-align: center;
@@ -168,6 +219,14 @@
     <div class="stats">
       <span>REPORTED LOST</span>
       <span><strong id="countLost">0</strong> devices</span>
+    </div>
+    <div class="stats watching">
+      <span>👁 WATCHED BY FINDERS</span>
+      <span><strong id="countWatched">0</strong></span>
+    </div>
+    <div class="filter-bar">
+      <button id="filterAll" class="active">ALL</button>
+      <button id="filterWatched" class="watched">👁 WATCHED ONLY</button>
     </div>
     <div id="deviceList">
       <div class="empty">Loading…</div>
@@ -211,9 +270,12 @@ const $ = (id) => document.getElementById(id);
 
 let map = null;
 let markers = {};
-let devices = {};
+let devices = {};       // uid -> device data (includes watchers)
 let selectedUid = null;
 let pollTimer = null;
+let watcherSubs = {};   // uid -> live listener handle
+let filterMode = "all"; // "all" | "watched"
+let knownWatchers = {}; // uid -> Set of watcherUids we've already seen (to avoid re-alerting)
 
 // ---- Login ----
 function checkLogin() {
@@ -254,6 +316,111 @@ function initMap() {
   }).addTo(map);
 }
 
+// ---- Watchers: fetch names once per watcher uid ----
+const watcherNameCache = {};
+async function getWatcherName(uid) {
+  if (watcherNameCache[uid] !== undefined) return watcherNameCache[uid];
+  try {
+    const snap = await db.ref("users/" + uid + "/profile").get();
+    const prof = snap.exists() ? snap.val() : null;
+    const name = (prof && prof.name) ? prof.name : "Unknown finder";
+    const code = (prof && prof.code) ? prof.code : "";
+    watcherNameCache[uid] = { name, code };
+    return watcherNameCache[uid];
+  } catch (_) {
+    watcherNameCache[uid] = { name: "Unknown finder", code: "" };
+    return watcherNameCache[uid];
+  }
+}
+
+async function buildWatcherList(uid) {
+  try {
+    const snap = await db.ref("users/" + uid + "/watchers").get();
+    if (!snap.exists()) return [];
+    const raw = snap.val() || {};
+    const list = [];
+    for (const finderUid of Object.keys(raw)) {
+      const info = await getWatcherName(finderUid);
+      list.push({ uid: finderUid, name: info.name, code: info.code });
+    }
+    return list;
+  } catch (_) {
+    return [];
+  }
+}
+
+// ---- Live watcher listeners ----
+function attachWatcherListeners(activeUids) {
+  // Remove listeners for uids no longer in the list
+  for (const uid of Object.keys(watcherSubs)) {
+    if (!activeUids.includes(uid)) {
+      try { watcherSubs[uid].off(); } catch (_) {}
+      delete watcherSubs[uid];
+      delete knownWatchers[uid];
+    }
+  }
+
+  // Add listeners for new uids
+  for (const uid of activeUids) {
+    if (watcherSubs[uid]) continue;
+
+    // Track known watchers on first load so we don't alert for old ones
+    if (!knownWatchers[uid]) {
+      db.ref("users/" + uid + "/watchers").once("value").then((snap) => {
+        const set = new Set();
+        if (snap.exists()) {
+          Object.keys(snap.val() || {}).forEach((k) => set.add(k));
+        }
+        knownWatchers[uid] = set;
+      }).catch(() => { knownWatchers[uid] = new Set(); });
+    }
+
+    const ref = db.ref("users/" + uid + "/watchers");
+    const handler = ref.on("value", async (snap) => {
+      const raw = snap.val() || {};
+      const currentWatchers = Object.keys(raw);
+
+      // Detect NEW watcher arrival
+      const prev = knownWatchers[uid] || new Set();
+      for (const wUid of currentWatchers) {
+        if (!prev.has(wUid)) {
+          const info = await getWatcherName(wUid);
+          onNewWatcher(devices[uid] ? devices[uid].name : uid, info.name);
+        }
+      }
+      knownWatchers[uid] = new Set(currentWatchers);
+
+      // Rebuild the device's watcher list
+      const list = [];
+      for (const finderUid of currentWatchers) {
+        const info = await getWatcherName(finderUid);
+        list.push({ uid: finderUid, name: info.name, code: info.code });
+      }
+      if (devices[uid]) {
+        devices[uid].watchers = list;
+        devices[uid].watchCount = list.length;
+        // Refresh UI
+        renderDevices();
+        updateWatchedCount();
+        if (markers[uid]) markers[uid].setPopupContent(popupHtml(devices[uid]));
+      }
+    });
+
+    watcherSubs[uid] = { off: () => ref.off("value", handler), ref };
+  }
+}
+
+function onNewWatcher(deviceName, finderName) {
+  if (navigator.vibrate) navigator.vibrate([200, 100, 200]);
+  $("alertText").textContent =
+    "👁 " + finderName + " is now watching \"" + deviceName + "\"";
+  $("alertBanner").classList.add("show", "watch");
+  setTimeout(() => {
+    hideBanner();
+    $("alertBanner").classList.remove("watch");
+  }, 7000);
+}
+
 // ---- Polling ----
 async function fetchLostDevices() {
   try {
@@ -275,6 +442,9 @@ async function fetchLostDevices() {
       const online = lastActive > 0 && (now - lastActive) < 180000;
       const recent = lastActive > 0 && (now - lastActive) < 3600000;
 
+      // Preserve watcher data from previous poll (listener keeps it fresh)
+      const prevWatchers = (devices[uid] && devices[uid].watchers) || [];
+
       next[uid] = {
         uid,
         name: profile.name || "Unknown",
@@ -287,9 +457,12 @@ async function fetchLostDevices() {
         acc: loc.acc || null,
         locTime: loc.time || 0,
         reportedAt: lost.reportedAt || 0,
+        watchers: prevWatchers,
+        watchCount: prevWatchers.length,
       };
     }
 
+    // Detect a device that just came online
     for (const uid of Object.keys(next)) {
       const was = devices[uid];
       const nowD = next[uid];
@@ -299,8 +472,13 @@ async function fetchLostDevices() {
     }
 
     devices = next;
+
+    // Attach/refresh watcher listeners for current lost uids
+    attachWatcherListeners(Object.keys(devices));
+
     renderDevices();
     renderMarkers();
+    updateWatchedCount();
     $("lastUpdate").textContent = "Updated " + new Date().toLocaleTimeString();
   } catch (e) {
     console.warn("fetch error:", e.message);
@@ -365,18 +543,39 @@ async function ringDevice(uid) {
 }
 
 // ---- Rendering ----
+function updateWatchedCount() {
+  const watched = Object.values(devices).filter(
+    (d) => (d.watchCount || 0) > 0
+  ).length;
+  $("countWatched").textContent = watched;
+}
+
+function getVisibleUids() {
+  const all = Object.keys(devices);
+  if (filterMode === "watched") {
+    return all.filter((uid) => (devices[uid].watchCount || 0) > 0);
+  }
+  return all;
+}
+
 function renderDevices() {
   const list = $("deviceList");
-  const keys = Object.keys(devices);
-  $("countLost").textContent = keys.length;
+  const keys = getVisibleUids();
+  $("countLost").textContent = Object.keys(devices).length;
 
   if (keys.length === 0) {
-    list.innerHTML = '<div class="empty">No devices currently reported as lost.</div>';
+    list.innerHTML = filterMode === "watched"
+      ? '<div class="empty">No lost devices are currently being watched by any finder.</div>'
+      : '<div class="empty">No devices currently reported as lost.</div>';
     return;
   }
 
   keys.sort((a, b) => {
     const A = devices[a], B = devices[b];
+    // Sort watched devices to the top, then by online status
+    const wA = (A.watchCount || 0) > 0 ? 1 : 0;
+    const wB = (B.watchCount || 0) > 0 ? 1 : 0;
+    if (wA !== wB) return wB - wA;
     const scoreA = A.online ? 3 : (A.recent ? 2 : 1);
     const scoreB = B.online ? 3 : (B.recent ? 2 : 1);
     return scoreB - scoreA;
@@ -389,11 +588,32 @@ function renderDevices() {
     const lastSeen = d.lastActive > 0
       ? new Date(d.lastActive).toLocaleString()
       : "never";
-    return '<div class="device-row ' + (uid === selectedUid ? 'selected' : '') + '" data-uid="' + uid + '">' +
+
+    const watchers = d.watchers || [];
+    const hasWatchers = watchers.length > 0;
+
+    const watchedBadge = hasWatchers
+      ? '<span class="badge watched">👁 WATCHED · ' + watchers.length + '</span>'
+      : '';
+
+    const watcherNames = hasWatchers
+      ? '<div class="watcher-names"><span class="label">Watching:</span> ' +
+        watchers.map((w) => escapeHtml(w.name)).join(", ") +
+        '</div>'
+      : '';
+
+    return '<div class="device-row ' +
+      (uid === selectedUid ? 'selected ' : '') +
+      (hasWatchers ? 'watched' : '') +
+      '" data-uid="' + uid + '">' +
       '<div class="name">' + escapeHtml(d.name) + '</div>' +
       '<div class="code">' + escapeHtml(d.code) + '</div>' +
       '<div class="meta">Last seen: ' + lastSeen + '</div>' +
-      '<div class="badge ' + badgeClass + '">' + badgeText + '</div>' +
+      '<div class="badges">' +
+        '<span class="badge ' + badgeClass + '">' + badgeText + '</span>' +
+        watchedBadge +
+      '</div>' +
+      watcherNames +
       '<button class="ring-btn" data-ring="' + uid + '">🔔 RING</button>' +
       '</div>';
   }).join("");
@@ -429,8 +649,12 @@ function renderMarkers() {
     const d = devices[uid];
     if (d.lat == null || d.lon == null) continue;
 
-    const color = d.online ? "#22c55e" : (d.recent ? "#d4a017" : "#888");
-    const circle = '<span style="display:inline-block;width:14px;height:14px;border-radius:50%;background:' + color + ';border:2px solid #fff;box-shadow:0 0 6px rgba(0,0,0,0.6);"></span>';
+    const isWatched = (d.watchCount || 0) > 0;
+    // Watched devices get a purple ring; otherwise color by online status
+    const color = isWatched ? "#a78bfa"
+      : (d.online ? "#22c55e" : (d.recent ? "#d4a017" : "#888"));
+    const ring = isWatched ? 'box-shadow:0 0 0 4px rgba(124,58,237,0.35),0 0 8px rgba(0,0,0,0.6);' : 'box-shadow:0 0 6px rgba(0,0,0,0.6);';
+    const circle = '<span style="display:inline-block;width:14px;height:14px;border-radius:50%;background:' + color + ';border:2px solid #fff;' + ring + '"></span>';
 
     const icon = L.divIcon({
       html: circle,
@@ -453,11 +677,24 @@ function renderMarkers() {
 }
 
 function popupHtml(d) {
+  const watchers = d.watchers || [];
+  const watchersHtml = watchers.length > 0
+    ? '<div style="margin-top:6px;padding-top:6px;border-top:1px solid #333;">' +
+      '<span style="color:#a78bfa;font-weight:bold;">👁 Watched by:</span><br>' +
+      watchers.map((w) =>
+        '<span style="color:#ccc;">' + escapeHtml(w.name) +
+        (w.code ? ' <span style="color:#666;">(' + escapeHtml(w.code) + ')</span>' : '') +
+        '</span>'
+      ).join("<br>") +
+      '</div>'
+    : '';
+
   return '<div style="font-size:12px;line-height:1.5;">' +
     '<strong>' + escapeHtml(d.name) + '</strong><br>' +
     '<span style="color:#22c55e;">' + escapeHtml(d.code) + '</span><br>' +
     '<span style="color:' + (d.online ? '#22c55e' : '#888') + ';">' + (d.online ? 'ONLINE' : 'Offline') + '</span><br>' +
     (d.locTime ? 'Last: ' + new Date(d.locTime).toLocaleString() : '') +
+    watchersHtml +
     '</div>';
 }
 
@@ -493,6 +730,20 @@ function escapeHtml(s) {
     .replaceAll("'", "&#039;");
 }
 
+// ---- Filters ----
+$("filterAll").addEventListener("click", () => {
+  filterMode = "all";
+  $("filterAll").classList.add("active");
+  $("filterWatched").classList.remove("active");
+  renderDevices();
+});
+$("filterWatched").addEventListener("click", () => {
+  filterMode = "watched";
+  $("filterWatched").classList.add("active");
+  $("filterAll").classList.remove("active");
+  renderDevices();
+});
+
 // ---- Start ----
 async function startApp() {
   initMap();
@@ -503,7 +754,7 @@ async function startApp() {
 $("refreshBtn").addEventListener("click", fetchLostDevices);
 $("fitAllBtn").addEventListener("click", fitAll);
 $("ringAllBtn").addEventListener("click", async () => {
-  const uids = Object.keys(devices);
+  const uids = getVisibleUids();
   if (uids.length === 0) { alert("No devices to ring."); return; }
   if (!confirm("Ring ALL " + uids.length + " devices?")) return;
   for (const uid of uids) {
